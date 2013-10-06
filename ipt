@@ -1,0 +1,175 @@
+#!/usr/bin/perl -w
+
+use strict;
+#my $dir = $0;
+#$dir =~ s/ipt$//;
+#unshift(@INC, "/usr/local/bin/");
+use iptcon;
+my($ipt)=new iptcon;
+
+my $nat;
+my %chains;
+my %policy;
+my $filt;
+my $chain;
+my @mods;
+
+sub stop {
+   my $r;
+   my @tables = `cat /proc/net/ip_tables_names`;
+   chomp(@tables);
+   my $table;
+   foreach $table (@tables) {
+      print "Flushing $table table\n";
+      if ($r = system('iptables', '-t', $table, '-F')) {
+         die "Error #$r; $!";
+      }
+      print "Delete all user defined chains\n";
+      if ($r = system('iptables', '-t', $table, '-X')) {
+         die "Error #$r; $!";
+      }
+   }
+   my $tbch;
+   foreach $tbch (qw(nat:PREROUTING nat:POSTROUTING nat:OUTPUT filter:INPUT filter:OUTPUT filter:FORWARD)) {
+      my ($tb,$ch) = split(/:/, $tbch);
+      print "Set ACCEPT policy $ch chain in $tb table\n";
+      if ($r = system('iptables', '-t', $tb, '-P', $ch, 'ACCEPT')) {
+         die "Error #$r; $!";
+      }
+   }
+}
+
+sub compile {
+   $ipt->Run();
+   exit 1 if (defined($ipt->{ErrStat}) && $ipt->{ErrStat});      
+   my $ch;
+   $nat    = $ipt->{Nat};
+   %chains = %{$ipt->{Chs}};
+   %policy = %{$ipt->{Pol}};
+   $filt   = $ipt->{Filt};
+   @mods   = @{$ipt->{Mods}};
+
+   foreach $ch (keys(%chains)) {
+      my $f = $chains{$ch};	#Ha O.K., akkor erteke 'DR' vagy 'RD'
+      if ($f eq 'D') { print STDERR "Warning: Unused chain : \"$ch\".\n"; }
+      if ($f eq 'R') { print STDERR "Error: Undeclared chain : \"$ch\".\n"; exit 1; }
+   }
+}
+
+sub ifaces() {
+   $ipt->Run();
+   exit 1 if (defined($ipt->{ErrStat}) && $ipt->{ErrStat});      
+   my %ifaces = %{$ipt->{Ifaces}};
+   if (!open(OUT, '>/var/log/ipt_ifaces.log')) { print STDERR "Output file open error\n"; }
+   foreach my $if (keys(%ifaces)) {
+      #print STDERR ("$if " . $ifaces{$if} . "\n");
+      print OUT ("$if " . $ifaces{$if} . "\n");
+   }
+}
+
+if (@ARGV) {
+   if ($ARGV[0] eq "stop") {
+      stop();
+      exit 0;
+   }
+   elsif ($ARGV[0] eq "restart") {
+      stop();
+   }
+   elsif ($ARGV[0] eq "start") {
+      ;
+   }
+   elsif ($ARGV[0] eq "check") {
+      &compile();
+      exit 0;
+   }
+   elsif ($ARGV[0] eq "ifaces") {
+      &ifaces();
+      exit 0;
+   }
+   else {
+      print "Invalid option(s).\n";
+      exit 1;
+   }
+}
+else {
+   print "Missing option.\n";
+   exit 1;
+}
+
+#$ipt->Run(Debug => 2);
+&compile();
+
+exit 1 if (defined($ipt->{ErrStat}) && $ipt->{ErrStat});
+
+# print "**************** NAT ********************\n$nat";
+# for (keys(%chains)) { print "CHs: $_ => $chains{$_}\n"; }
+# for (keys(%policy)) { print "Pol: $_ => $policy{$_}\n"; }
+# print "**************** FILT ********************\n$filt";
+
+my $res;
+
+###################### NAT ############################
+my @lines = split(/\n/, $nat);
+my $lin;
+foreach $lin (@lines) {
+   next if ($lin =~ m/^\s*$/); # Ures sorokat elhajigaljuk
+   print "Add nat rules: iptables -t nat $lin\n";
+   if ($res = system("iptables","-t","nat", split(/\s+/, $lin))) {
+      die "Error #$res; $!";
+   }
+}
+
+##################### FILTER ###########################
+
+sub chdef {
+   my ($ch) = @_ ;
+   print "Create user table: $ch\n";
+   if ($res = system('iptables', '-t', 'filter', '-N', $ch)) {
+      die "Error #$res; $!";
+   }
+}
+
+foreach $chain (keys(%chains)) {
+   chdef("${chain}i");
+   chdef("${chain}o");
+}
+
+# Ha hasznljuk a logdrop lancot, )s nincs definilva
+if ($filt =~ m/\-j\s+logdrop\s/ && !defined($chains{'logdrop'})) {
+    chdef("logdrop");
+    $filt .= "
+-I INPUT -i lo -j ACCEPT
+-I OUTPUT -o lo -j ACCEPT
+-A logdrop -p tcp -m pkttype --pkt-type broadcast -j DROP
+-A logdrop -p udp -m pkttype --pkt-type broadcast -j DROP
+-A logdrop -j LOG
+-A logdrop -j DROP
+";
+
+}
+
+@lines = split(/\n/, $filt);
+foreach $lin (@lines) {
+   next if ($lin =~ m/^\s*$/); # Ures sorokat elhajigaljuk
+   print "Add filter rules: iptables $lin\n";
+   if ($res = system("iptables", split(/\s+/, $lin))) {
+      die "Error #$res; $!";
+   }
+}
+
+my $dt;
+foreach $dt (qw(INPUT OUTPUT FORWARD)) {
+   my $pol =  $policy{$dt};
+   print "Set $dt policy: iptables -P $dt $pol\n";
+   if ($res = system("iptables", '-P', $dt, $pol)) {
+      die "Error #$res; $!";
+   }
+}
+my $m;
+foreach $m (@mods) {
+   print "Load $m kernel modul...\n";
+   system('modprobe', $m);
+}
+
+print STDERR "O.K.\n";
+0;
